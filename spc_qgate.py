@@ -1,66 +1,123 @@
 """
-Moduł SPC dla Q-Gate Dashboard
-Karty kontrolne Xbar-R dla linii Gen2 (1,2,3), Gen3 (9,10), HPC Uncooled
+Q-Gate Dashboard — Rzeszów
+Analiza próbek + Karty kontrolne SPC (Xbar-R)
 """
 
 import pandas as pd
-import numpy as np
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import datetime
+import io
 import re
 
-# ─── STAŁE SPC ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Q-Gate Dashboard", layout="wide", page_icon="📊")
 
-# Stałe dla karty Xbar-R (n=3)
-# A2, D3, D4 wg normy ISO/AIAG
-SPC_STALE = {
-    2: {'A2': 1.880, 'D3': 0.000, 'D4': 3.267, 'd2': 1.128},
-    3: {'A2': 1.023, 'D3': 0.000, 'D4': 2.574, 'd2': 1.693},
-    4: {'A2': 0.729, 'D3': 0.000, 'D4': 2.282, 'd2': 2.059},
-    5: {'A2': 0.577, 'D3': 0.000, 'D4': 2.114, 'd2': 2.326},
-}
+st.markdown("""
+<style>
+    /* ── Metryki ── */
+    .metric-card {
+        background: linear-gradient(135deg, #1e3a5f 0%, #2d5986 100%);
+        border-radius: 12px; padding: 1.2rem 1.5rem;
+        color: white; text-align: center;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+    }
+    .metric-card .label {
+        font-size: 0.75rem; opacity: 0.8; margin-bottom: 4px;
+        letter-spacing: 0.06em; text-transform: uppercase;
+    }
+    .metric-card .value { font-size: 2.1rem; font-weight: 700; line-height: 1; }
+    .metric-card .sub   { font-size: 0.72rem; opacity: 0.6; margin-top: 4px; }
 
-POMIARY = [
-    'Wysokość zaciskania - zrywy',
-    'Wysokość zaciskania -  kontrola przekroju na mikrografie',
-    'Wysokość zaciskania - próbka poglądowa',
-]
+    /* ── Ukryj domyślny header Streamlit ── */
+    header { visibility: hidden; }
 
-LINIE_SPC = ['1', '2', '3', '9', '10', 'HPC UNCOOLED']
+    /* ── Zakładki ── */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0; padding: 8px 20px;
+        font-weight: 500;
+    }
 
-NAZWY_LINII = {
-    '1': 'Linia 1 (Gen2)',
-    '2': 'Linia 2 (Gen2)',
-    '3': 'Linia 3 (Gen2)',
-    '9': 'Linia 9 (Gen3)',
-    '10': 'Linia 10 (Gen3)',
-    'HPC UNCOOLED': 'HPC 365 Uncooled',
-}
+    /* ── Dark mode dla sekcji SPC ── */
+    /* Plotly wykresy — usuń białe obramowanie */
+    .js-plotly-plot .plotly .main-svg {
+        border-radius: 10px;
+    }
+    /* Tło legendy wykresu SPC pasuje do dark bg */
+    [data-testid="stPlotlyChart"] {
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    }
 
-BLOK_NAZWA = {1: 'Connector', 2: 'Plug'}
+    /* ── SIDEBAR: zawsze widoczny, bez przycisku collapse ── */
+    /* Ukryj przycisk strzałki zwijania */
+    button[kind="header"],
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapseButton"] {
+        display: none !important;
+    }
+    /* Zawsze pokazuj sidebar (nawet gdy Streamlit chce go ukryć) */
+    [data-testid="stSidebar"] {
+        transform: none !important;
+        min-width: 21rem !important;
+        max-width: 21rem !important;
+    }
+    /* Usuń margines który pojawia się po "zwinięciu" */
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        margin-left: 0 !important;
+        visibility: visible !important;
+    }
+    /* Główna treść — zawsze z marginesem na sidebar */
+    .main .block-container {
+        padding-left: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Kolory
-COL_XBAR = '#2563eb'
-COL_R    = '#059669'
-COL_UCL  = '#dc2626'
-COL_LCL  = '#dc2626'
-COL_CL   = '#6b7280'
-COL_USL  = '#f59e0b'
-COL_LSL  = '#f59e0b'
-COL_OUT  = '#ef4444'
-COL_WARN = '#f97316'
+# ─── SILNIK ANALITYCZNY ───────────────────────────────────────────────────────
+
+LINIE_DO_IGNOROWANIA = {'`', '', 'NAN'}
 
 
-# ─── NORMALIZACJA LINII ───────────────────────────────────────────────────────
+def _znajdz_kolumne(df, *fragmenty, wymagana=True):
+    """Znajduje kolumnę zawierającą wszystkie podane fragmenty (bez względu
+    na spacje/wielkość liter). Odporne na różnice między wersjami pliku."""
+    def uprość(s):
+        return re.sub(r'\s+', ' ', str(s).lower().strip())
+    frag_low = [uprość(f) for f in fragmenty]
+    for col in df.columns:
+        cl = uprość(col)
+        if all(f in cl for f in frag_low):
+            return col
+    if wymagana:
+        raise KeyError(f"Nie znaleziono kolumny z fragmentami: {fragmenty}")
+    return None
 
-def norm_linia(t):
-    if pd.isna(t):
+
+def _wczytaj_arkusz(plik_excel, sheet_name):
+    """Wczytuje arkusz auto-wykrywając wiersz nagłówka (3 lub 2).
+    W nowszych plikach Qgate 2026 nagłówek przesunął się do wiersza 3."""
+    for hdr in (3, 2):
+        df = pd.read_excel(plik_excel, sheet_name=sheet_name,
+                           header=hdr, engine='openpyxl').copy()
+        cols_str = ' '.join(str(c) for c in df.columns[:12])
+        if 'Numer zlecenia' in cols_str and 'Kolumna1' not in cols_str:
+            return df
+    return pd.read_excel(plik_excel, sheet_name=sheet_name,
+                         header=2, engine='openpyxl').copy()
+
+
+def normalizuj_linie(tekst):
+    if pd.isna(tekst) or str(tekst).lower() in ['nan', 'none', '']:
         return ''
-    t = str(t).upper().strip()
+    t = str(tekst).upper().strip()
     t = re.sub(r'[\.\-/_]', ' ', t)
     t = ' '.join(t.split())
-    if 'UNI INLET' in t or t == 'INLET':
+    if 'NACS' in t and 'DC' in t:
+        return 'NACS DC'
+    if t == 'NAC' or t == 'NACS':
+        return 'NACS'
+    if 'UNIINLET' in t.replace(' ', '') or t == 'INLET':
         return 'INLET'
     if 'CCSD' in t.replace(' ', '') or t == 'CCS D':
         return 'CCS D'
@@ -70,589 +127,418 @@ def norm_linia(t):
         return 'HPC 1.0'
     if 'HPC' in t and '2' in t:
         return 'HPC 2.0'
+    if 'PREASSY' in t and 'GEN 3' in t:
+        return 'PREASSY GEN 3'
+    if 'PREASSY' in t and ('GEN 2' in t or 'GEN2' in t):
+        return 'PREASSY GEN 2'
     return t
 
 
-# ─── WCZYTANIE I PRZYGOTOWANIE DANYCH ────────────────────────────────────────
+@st.cache_data(show_spinner='Wczytuję dane...')
+def wczytaj_dane(plik_excel):
+    df = _wczytaj_arkusz(plik_excel, 'Qgate 2026')
+
+    c_zlec    = _znajdz_kolumne(df, 'numer zlecenia')
+    c_linia   = _znajdz_kolumne(df, 'nr linii')
+    c_kontakt = _znajdz_kolumne(df, 'numer kontaktu')
+    c_typ     = _znajdz_kolumne(df, 'typ pojedy')
+    c_data    = _znajdz_kolumne(df, 'data i czas startu')
+    c_zryw    = _znajdz_kolumne(df, 'zaciskania', 'zrywy')
+    c_mikro   = _znajdz_kolumne(df, 'zaciskania', 'mikrografie')
+    c_poglad  = _znajdz_kolumne(df, 'zaciskania', 'poglądowa')
+
+    for col in [c_zlec, c_linia, c_kontakt, c_typ]:
+        df[col] = df[col].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
+
+    df['Linia'] = df[c_linia].apply(normalizuj_linie)
+    df['Zlecenie'] = df[c_zlec].replace('', pd.NA).ffill()
+    df['Linia'] = df['Linia'].replace('', pd.NA).ffill()
+    df = df[~df['Linia'].isin(LINIE_DO_IGNOROWANIA)]
+
+    df['Data i czas startu zlecenia'] = pd.to_datetime(df[c_data], errors='coerce').ffill()
+    df['Data_kalendarzowa'] = df['Data i czas startu zlecenia'].dt.date
+
+    df['_zryw']  = pd.to_numeric(df[c_zryw], errors='coerce')
+    df['_mikro'] = pd.to_numeric(df[c_mikro], errors='coerce')
+    df['_pogl']  = pd.to_numeric(df[c_poglad], errors='coerce')
+    df['Kontakt'] = df[c_kontakt].astype(str).str.strip()
+    df['Typ'] = df[c_typ].astype(str).str.strip()
+
+    df['Wiersz_ma_probke'] = df[['_zryw', '_mikro', '_pogl']].notna().any(axis=1)
+
+    # Liczymy TYLKO wiersze z rzeczywistym pomiarem wysokości zaciskania.
+    zlecenia_status = df.groupby(
+        ['Zlecenie', 'Linia', 'Data_kalendarzowa']
+    )['Wiersz_ma_probke'].any().reset_index()
+    zestawy_aktywne = zlecenia_status[zlecenia_status['Wiersz_ma_probke']]
+
+    df_zestawy = pd.merge(
+        df, zestawy_aktywne[['Zlecenie', 'Linia', 'Data_kalendarzowa']],
+        on=['Zlecenie', 'Linia', 'Data_kalendarzowa'], how='inner',
+    )
+    # Klucz deduplikacji BEZ Data_kalendarzowa — ten sam kontakt mierzony
+    # na początku i końcu produkcji (różne dni) to nadal jedna próbka.
+    df_unikalne = df_zestawy[df_zestawy['Wiersz_ma_probke']].drop_duplicates(
+        subset=['Zlecenie', 'Linia', 'Kontakt', 'Typ']
+    ).copy()
+    df_unikalne['Sztuki_fizyczne'] = 3
+    # Aliasy dla zgodności z resztą kodu
+    df_unikalne['Numer kontaktu'] = df_unikalne['Kontakt']
+    df_unikalne['NR LINII '] = df_unikalne['Linia']
+
+    zlecenia_wynik = df_unikalne.groupby(['Zlecenie', 'Linia']).agg(
+        Suma_kontaktow=('Kontakt', 'size'),
+        Data_max=('Data i czas startu zlecenia', 'max'),
+    ).reset_index().rename(columns={
+        'Data_max': 'Data i czas startu zlecenia',
+        'Linia': 'NR LINII ',
+    })
+
+    zlecenia_wynik['Data_kalendarzowa'] = zlecenia_wynik['Data i czas startu zlecenia'].dt.date
+    zlecenia_wynik['Ilosc_zestawow'] = 1
+    zlecenia_wynik['Ilosc_fizycznych_probek'] = zlecenia_wynik['Suma_kontaktow'] * 3
+
+    return zlecenia_wynik, df_unikalne
+
 
 @st.cache_data(show_spinner=False)
-def przygotuj_dane_spc(plik_excel):
-    df = pd.read_excel(plik_excel, sheet_name='Qgate 2026', header=2, engine='openpyxl').copy()
+def wczytaj_gmc121(plik_excel):
+    """Zliczanie próbek do SAP z arkusza GM C121 (Preassembly).
+    Każdy wiersz z pomiarami = 3 sztuki fizyczne (1 zestaw × 3 szt.).
+    """
+    df = _wczytaj_arkusz(plik_excel, 'GM C121 (Preassembly)')
 
-    # Czyszczenie podstawowe
-    for col in ['Numer zlecenia ', 'NR LINII ', 'Numer kontaktu', 'Typ pojedyńczego przewodu']:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
+    c_zlec    = _znajdz_kolumne(df, 'numer zlecenia')
+    c_kontakt = _znajdz_kolumne(df, 'numer kontaktu')
+    c_typ     = _znajdz_kolumne(df, 'typ pojedy')
+    c_data    = _znajdz_kolumne(df, 'data i czas startu')
+    c_zryw    = _znajdz_kolumne(df, 'zaciskania', 'zrywy')
+    c_mikro   = _znajdz_kolumne(df, 'zaciskania', 'mikrografie')
+    c_poglad  = _znajdz_kolumne(df, 'zaciskania', 'poglądowa')
 
-    df['Numer zlecenia '] = df['Numer zlecenia '].replace('', pd.NA).ffill()
-    df['NR LINII '] = df['NR LINII '].replace('', pd.NA).ffill()
-    df['Linia'] = df['NR LINII '].apply(norm_linia)
-    df['Typ'] = df['Typ pojedyńczego przewodu'].astype(str).str.strip()
-    df['Maszyna'] = df['Nazwa maszyny'].astype(str).str.strip()
-    df['Numer kontaktu'] = df['Numer kontaktu'].astype(str).str.strip()
-    df['Przekroj'] = df['Przekrój '].astype(str).str.strip()
+    df[c_zlec] = df[c_zlec].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
+    df['Zlecenie'] = df[c_zlec].replace('', pd.NA).ffill()
+    df['Numer kontaktu'] = df[c_kontakt].astype(str).str.strip()
+    df['Typ'] = df[c_typ].fillna('').astype(str).str.strip()
+    df['Data'] = pd.to_datetime(df[c_data], errors='coerce').ffill()
+    df['Data_kalendarzowa'] = df['Data'].dt.date
+    df['NR LINII '] = 'GM C121'
 
-    df['Data'] = pd.to_datetime(df['Data i czas startu zlecenia'], errors='coerce').ffill()
+    df['_zryw']  = pd.to_numeric(df[c_zryw], errors='coerce')
+    df['_mikro'] = pd.to_numeric(df[c_mikro], errors='coerce')
+    df['_pogl']  = pd.to_numeric(df[c_poglad], errors='coerce')
 
-    for c in POMIARY:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
+    # Liczba kontaktów per wiersz = liczba wypełnionych kolumn wysokości
+    # ZMP (zrywy+mikrograf+poglądowa) = 3 kontakty = 3 szt.
+    # Z__ / __P (jedna kolumna)       = 1 kontakt  = 1 szt.
+    df['n_kontaktow'] = df[['_zryw', '_mikro', '_pogl']].notna().sum(axis=1)
+    df['ma_pomiar'] = df['n_kontaktow'] > 0
 
-    df['LSL'] = pd.to_numeric(df['Wysokość zagniatania LSL w mm'], errors='coerce')
-    df['USL'] = pd.to_numeric(df['Wysokośc zaciskania USL w mm'], errors='coerce')
-    df['ma_pomiar'] = df[POMIARY].notna().any(axis=1)
+    df_pom = df[df['ma_pomiar']].copy()
 
-    # Tylko interesujące linie
-    df = df[df['Linia'].isin(LINIE_SPC)].copy()
+    if df_pom.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    # Przypisanie bloków (connector=1, plug=2) per zlecenie
-    # Linie bez struktury CP (np. HPC Uncooled) dostają blok=1
-    wyniki = []
-    for (z, linia), grp in df.groupby(['Numer zlecenia ', 'Linia'], sort=False):
-        grp = grp.reset_index(drop=True)
-        cp_rows = grp[grp['Typ'] == 'CP']
-        unikalne_cp = list(dict.fromkeys(cp_rows['Numer kontaktu'].tolist()))
+    zlec = df_pom.groupby('Zlecenie').agg(
+        Suma_kontaktow=('n_kontaktow', 'sum'),
+        Data_max=('Data', 'max'),
+    ).reset_index().rename(columns={'Zlecenie': 'Numer zlecenia '})
+    zlec['NR LINII '] = 'GM C121'
+    zlec['Data i czas startu zlecenia'] = zlec.pop('Data_max')
+    zlec['Data_kalendarzowa'] = zlec['Data i czas startu zlecenia'].dt.date
+    zlec['Ilosc_zestawow'] = 1
+    zlec['Ilosc_fizycznych_probek'] = zlec['Suma_kontaktow']  # 1 kolumna = 1 szt.
 
-        if not unikalne_cp:
-            # Brak CP — cała linia to jeden blok (np. HPC z samym PE/DC)
-            grp['blok'] = 1
+    # SAP per PN + Typ
+    df_pom['PN'] = df_pom['Numer kontaktu'].astype(str).str.strip()
+    df_pom.loc[df_pom['PN'].isin(['nan', 'None', '']), 'PN'] = 'BRAK_PN'
+    sap = df_pom.groupby(['PN', 'Typ']).agg(
+        Kontakty=('n_kontaktow', 'sum')
+    ).reset_index()
+    sap['Sztuki'] = sap['Kontakty']
+    sap = sap.drop(columns='Kontakty').rename(
+        columns={'PN': 'Numer kontaktu (PN)'}
+    ).sort_values('Sztuki', ascending=False).reset_index(drop=True)
+
+    return zlec, sap
+
+
+def wygeneruj_excel(df_linia, df_sap, df_trend=None):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_linia.to_excel(writer, index=False, sheet_name='Podsumowanie Linii')
+        df_sap.to_excel(writer, index=False, sheet_name='Ściągawka SAP')
+        if df_trend is not None:
+            df_trend.to_excel(writer, index=False, sheet_name='Trend Dzienny')
+    return output.getvalue()
+
+
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+
+st.title('📊 Q-Gate Dashboard — Rzeszów')
+
+with st.sidebar:
+    st.markdown('### 📁 Q-Gate Dashboard')
+    plik = st.file_uploader(
+        'Wgraj plik Q-Gate:',
+        type=['xlsx', 'xlsm'],
+        help='Format: xlsx lub xlsm, arkusz "Qgate 2026"',
+        label_visibility='collapsed',
+    )
+    if plik:
+        st.success(f'✅ {plik.name}', icon=None)
+    else:
+        st.caption('Obsługiwane: .xlsx, .xlsm')
+
+if not plik:
+    st.info('👈 Wgraj plik produkcyjny Q-Gate żeby rozpocząć.')
+    st.markdown("""
+    **Obsługiwane formaty:** `.xlsx`, `.xlsm`  
+    **Wymagany arkusz:** `Qgate 2026`  
+    **Nagłówek:** wiersz 3
+    """)
+    st.stop()
+
+# ─── WCZYTANIE ───────────────────────────────────────────────────────────────
+
+try:
+    df_zlecenia, df_kontakty = wczytaj_dane(plik)
+except Exception as e:
+    st.error(f'❌ Błąd podczas wczytywania: {e}')
+    st.stop()
+
+if df_zlecenia.empty:
+    st.warning('⚠️ Plik nie zawiera danych spełniających kryteria.')
+    st.stop()
+
+# ─── ZAKŁADKI ────────────────────────────────────────────────────────────────
+# Inicjalizacja zmiennych filtrów (będą wypełnione w sidebar)
+s_dt = e_dt = pd.Timestamp.now()
+wybrany_m = ''
+
+tab_raport, tab_spc = st.tabs(['📋 Raport produkcji', '📈 Karty SPC'])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ZAKŁADKA 1 — RAPORT PRODUKCJI
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_raport:
+    with st.sidebar:
+        st.markdown('---')
+        tryb = st.radio('Rodzaj raportu:', ['Dzienny / Zmianowy', 'Miesięczny', 'Zakres dat'])
+        dostepne_linie = sorted(df_zlecenia['NR LINII '].dropna().unique())
+        wybrane_linie = st.multiselect('Filtruj linie (puste = wszystkie):', dostepne_linie)
+
+        if tryb == 'Dzienny / Zmianowy':
+            min_d = df_zlecenia['Data i czas startu zlecenia'].min().date()
+            max_d = df_zlecenia['Data i czas startu zlecenia'].max().date()
+            wybrana_d = st.date_input('Dzień:', value=max_d, min_value=min_d, max_value=max_d)
+            c1, c2 = st.columns(2)
+            od_g = c1.time_input('Od:', value=datetime.time(6, 0))
+            do_g = c2.time_input('Do:', value=datetime.time(14, 0))
+            s_dt = pd.to_datetime(f'{wybrana_d} {od_g}')
+            e_dt = pd.to_datetime(f'{wybrana_d} {do_g}')
+            if do_g <= od_g:
+                e_dt += pd.Timedelta(days=1)
+            df_f = df_zlecenia[
+                (df_zlecenia['Data i czas startu zlecenia'] >= s_dt) &
+                (df_zlecenia['Data i czas startu zlecenia'] <= e_dt)
+            ]
+            df_k_f = df_kontakty[
+                (df_kontakty['Data i czas startu zlecenia'] >= s_dt) &
+                (df_kontakty['Data i czas startu zlecenia'] <= e_dt)
+            ]
+            tytul = f"Zmiana: {s_dt.strftime('%d.%m.%Y %H:%M')} – {e_dt.strftime('%H:%M')}"
+
+        elif tryb == 'Miesięczny':
+            df_zlecenia['YM'] = df_zlecenia['Data i czas startu zlecenia'].dt.strftime('%Y-%m')
+            df_kontakty['YM'] = df_kontakty['Data i czas startu zlecenia'].dt.strftime('%Y-%m')
+            wybrany_m = st.selectbox('Miesiąc:', sorted(df_zlecenia['YM'].unique(), reverse=True))
+            df_f = df_zlecenia[df_zlecenia['YM'] == wybrany_m]
+            df_k_f = df_kontakty[df_kontakty['YM'] == wybrany_m]
+            tytul = f'Raport miesięczny: {wybrany_m}'
+
         else:
-            cp_to_blok = {cp: i + 1 for i, cp in enumerate(unikalne_cp)}
-            current_blok = None
-            bloki = []
-            for _, row in grp.iterrows():
-                if row['Typ'] == 'CP':
-                    current_blok = cp_to_blok.get(row['Numer kontaktu'])
-                bloki.append(current_blok)
-            grp['blok'] = bloki
-
-        wyniki.append(grp)
-
-    df_b = pd.concat(wyniki, ignore_index=True) if wyniki else pd.DataFrame()
-
-    # Budowanie podgrup Xbar-R
-    # Podgrupa = jedno zlecenie + linia + blok + typ + maszyna + przekroj
-    df_pom = df_b[df_b['ma_pomiar']].copy()
-
-    podgrupy = []
-    grp_cols = ['Numer zlecenia ', 'Linia', 'blok', 'Typ', 'Maszyna', 'Przekroj']
-
-    for keys, grp in df_pom.groupby(grp_cols, sort=False):
-        z, linia, blok, typ, masz, przekroj = keys
-        vals = grp[POMIARY].values.flatten()
-        vals = vals[~np.isnan(vals)]
-        if len(vals) == 0:
-            continue
-
-        n = len(vals)
-        lsl = grp['LSL'].dropna().iloc[0] if grp['LSL'].notna().any() else np.nan
-        usl = grp['USL'].dropna().iloc[0] if grp['USL'].notna().any() else np.nan
-        data = grp['Data'].iloc[0]
-
-        podgrupy.append({
-            'Zlecenie': z,
-            'Linia': linia,
-            'Blok': blok,
-            'Typ': typ,
-            'Maszyna': masz,
-            'Przekroj': przekroj,
-            'Data': data,
-            'Tydzien': int(data.isocalendar().week),
-            'Rok': int(data.year),
-            'Xbar': float(np.mean(vals)),
-            'R': float(np.max(vals) - np.min(vals)),
-            'n': n,
-            'LSL': float(lsl) if not np.isnan(lsl) else np.nan,
-            'USL': float(usl) if not np.isnan(usl) else np.nan,
-        })
-
-    return pd.DataFrame(podgrupy)
-
-
-# ─── OBLICZENIA SPC ──────────────────────────────────────────────────────────
-
-def oblicz_granice(df_pg: pd.DataFrame) -> dict:
-    """Oblicza granice kontrolne Xbar-R dla zestawu podgrup."""
-    if df_pg.empty:
-        return {}
-
-    # Używamy stałych dla n=3 (dominujący rozmiar podgrupy)
-    n_typowy = int(df_pg['n'].mode().iloc[0]) if not df_pg.empty else 3
-    n_typowy = max(2, min(n_typowy, 5))  # clamp do obsługiwanych
-    st = SPC_STALE[n_typowy]
-
-    Xbarbar = df_pg['Xbar'].mean()
-    Rbar = df_pg['R'].mean()
-
-    UCL_x = Xbarbar + st['A2'] * Rbar
-    LCL_x = Xbarbar - st['A2'] * Rbar
-    UCL_r = st['D4'] * Rbar
-    LCL_r = st['D3'] * Rbar
-
-    # Cp / Cpk
-    lsl = df_pg['LSL'].dropna().mean()
-    usl = df_pg['USL'].dropna().mean()
-
-    sigma_hat = Rbar / st['d2'] if st['d2'] > 0 else np.nan
-    cp = cpk = np.nan
-    if not (np.isnan(lsl) or np.isnan(usl) or np.isnan(sigma_hat) or sigma_hat == 0):
-        cp = (usl - lsl) / (6 * sigma_hat)
-        cpu = (usl - Xbarbar) / (3 * sigma_hat)
-        cpl = (Xbarbar - lsl) / (3 * sigma_hat)
-        cpk = min(cpu, cpl)
-
-    return {
-        'Xbarbar': Xbarbar,
-        'Rbar': Rbar,
-        'UCL_x': UCL_x,
-        'LCL_x': LCL_x,
-        'UCL_r': UCL_r,
-        'LCL_r': LCL_r,
-        'LSL': lsl,
-        'USL': usl,
-        'sigma_hat': sigma_hat,
-        'Cp': cp,
-        'Cpk': cpk,
-        'n_podgrup': len(df_pg),
-    }
-
-
-def wykryj_sygnaly(df_pg: pd.DataFrame, granice: dict) -> pd.Series:
-    """
-    Reguły Nelson/Western Electric:
-    1. Punkt poza UCL/LCL (3σ)
-    2. 2 z 3 kolejnych poza 2σ po tej samej stronie
-    3. 4 z 5 kolejnych poza 1σ po tej samej stronie
-    4. 8 kolejnych po tej samej stronie linii centralnej
-    """
-    if df_pg.empty or not granice:
-        return pd.Series([], dtype=str)
-
-    x = df_pg['Xbar'].values
-    cl = granice['Xbarbar']
-    sigma3 = granice['UCL_x'] - cl
-    sigma1 = sigma3 / 3
-    sigma2 = 2 * sigma1
-
-    sygnaly = np.full(len(x), '', dtype=object)
-
-    for i in range(len(x)):
-        # Reguła 1: poza 3σ
-        if abs(x[i] - cl) > sigma3:
-            sygnaly[i] = 'poza_3sigma'
-            continue
-        # Reguła 2: 2 z 3 poza 2σ
-        if i >= 2:
-            seg = x[i-2:i+1]
-            if sum(v > cl + sigma2 for v in seg) >= 2 or sum(v < cl - sigma2 for v in seg) >= 2:
-                sygnaly[i] = 'reguła_2z3'
-                continue
-        # Reguła 3: 4 z 5 poza 1σ
-        if i >= 4:
-            seg = x[i-4:i+1]
-            if sum(v > cl + sigma1 for v in seg) >= 4 or sum(v < cl - sigma1 for v in seg) >= 4:
-                sygnaly[i] = 'reguła_4z5'
-                continue
-        # Reguła 4: 8 z jednej strony
-        if i >= 7:
-            seg = x[i-7:i+1]
-            if all(v > cl for v in seg) or all(v < cl for v in seg):
-                sygnaly[i] = 'reguła_8'
-
-    return pd.Series(sygnaly, index=df_pg.index)
-
-
-# ─── RYSOWANIE KART ──────────────────────────────────────────────────────────
-
-def rysuj_karte_xbar_r(df_pg: pd.DataFrame, granice: dict, tytul: str) -> go.Figure:
-    if df_pg.empty:
-        return go.Figure()
-
-    df_pg = df_pg.sort_values('Data').reset_index(drop=True)
-    sygnaly = wykryj_sygnaly(df_pg, granice)
-    df_pg['sygnal'] = sygnaly.values
-
-    # Etykiety na osi X: numer zlecenia skrócony + data
-    labels = [f"{row['Data'].strftime('%d.%m')}\n{row['Zlecenie'][-4:]}"
-              for _, row in df_pg.iterrows()]
-
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=('X̄ — Średnia podgrupy', 'R — Rozstęp podgrupy'),
-        vertical_spacing=0.12,
-        row_heights=[0.6, 0.4],
-    )
-
-    # ── Karta Xbar ──
-    # Strefa wypełnienia ±1σ, ±2σ, ±3σ
-    x_idx = list(range(len(df_pg)))
-    cl = granice['Xbarbar']
-    sigma3 = granice['UCL_x'] - cl
-    sigma1 = sigma3 / 3
-    sigma2 = 2 * sigma1
-
-    for mult, alpha in [(3, 0.04), (2, 0.07), (1, 0.11)]:
-        fig.add_trace(go.Scatter(
-            x=x_idx + x_idx[::-1],
-            y=[cl + mult * sigma1] * len(x_idx) + [cl - mult * sigma1] * len(x_idx),
-            fill='toself',
-            fillcolor=f'rgba(37,99,235,{alpha})',
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo='skip',
-        ), row=1, col=1)
-
-    # UCL / LCL / CL
-    for val, name, color, dash in [
-        (granice['UCL_x'], 'UCL', COL_UCL, 'dash'),
-        (granice['LCL_x'], 'LCL', COL_LCL, 'dash'),
-        (cl, 'X̄̄', COL_CL, 'solid'),
-    ]:
-        fig.add_hline(y=val, line_color=color, line_dash=dash, line_width=1.5,
-                      annotation_text=f'{name}={val:.4f}',
-                      annotation_position='right',
-                      annotation_font_size=10,
-                      row=1, col=1)
-
-    # USL / LSL
-    if not np.isnan(granice.get('USL', np.nan)):
-        fig.add_hline(y=granice['USL'], line_color=COL_USL, line_dash='dot', line_width=2,
-                      annotation_text=f"USL={granice['USL']:.3f}",
-                      annotation_position='right',
-                      annotation_font_size=10,
-                      row=1, col=1)
-    if not np.isnan(granice.get('LSL', np.nan)):
-        fig.add_hline(y=granice['LSL'], line_color=COL_LSL, line_dash='dot', line_width=2,
-                      annotation_text=f"LSL={granice['LSL']:.3f}",
-                      annotation_position='right',
-                      annotation_font_size=10,
-                      row=1, col=1)
-
-    # Punkty — normalne
-    mask_ok = df_pg['sygnal'] == ''
-    mask_warn = df_pg['sygnal'].isin(['reguła_2z3', 'reguła_4z5', 'reguła_8'])
-    mask_out = df_pg['sygnal'] == 'poza_3sigma'
-
-    hover_xbar = [
-        f"Zlecenie: {row['Zlecenie']}<br>"
-        f"Data: {row['Data'].strftime('%d.%m.%Y %H:%M')}<br>"
-        f"X̄ = {row['Xbar']:.4f}<br>"
-        f"R = {row['R']:.4f}<br>"
-        f"n = {row['n']}"
-        for _, row in df_pg.iterrows()
-    ]
-
-    # Linia łącząca
-    fig.add_trace(go.Scatter(
-        x=x_idx, y=df_pg['Xbar'],
-        mode='lines',
-        line=dict(color=COL_XBAR, width=1.5),
-        showlegend=False,
-        hoverinfo='skip',
-    ), row=1, col=1)
-
-    # Punkty OK
-    if mask_ok.any():
-        fig.add_trace(go.Scatter(
-            x=[i for i, m in enumerate(mask_ok) if m],
-            y=df_pg.loc[mask_ok, 'Xbar'],
-            mode='markers',
-            marker=dict(color=COL_XBAR, size=8, symbol='circle'),
-            name='OK',
-            customdata=[hover_xbar[i] for i, m in enumerate(mask_ok) if m],
-            hovertemplate='%{customdata}<extra></extra>',
-        ), row=1, col=1)
-
-    # Ostrzeżenia
-    if mask_warn.any():
-        fig.add_trace(go.Scatter(
-            x=[i for i, m in enumerate(mask_warn) if m],
-            y=df_pg.loc[mask_warn, 'Xbar'],
-            mode='markers',
-            marker=dict(color=COL_WARN, size=10, symbol='diamond',
-                        line=dict(color='white', width=1)),
-            name='Ostrzeżenie',
-            customdata=[hover_xbar[i] for i, m in enumerate(mask_warn) if m],
-            hovertemplate='%{customdata}<extra></extra>',
-        ), row=1, col=1)
-
-    # Poza granicami
-    if mask_out.any():
-        fig.add_trace(go.Scatter(
-            x=[i for i, m in enumerate(mask_out) if m],
-            y=df_pg.loc[mask_out, 'Xbar'],
-            mode='markers',
-            marker=dict(color=COL_OUT, size=12, symbol='x',
-                        line=dict(color=COL_OUT, width=2)),
-            name='Poza kontrolą',
-            customdata=[hover_xbar[i] for i, m in enumerate(mask_out) if m],
-            hovertemplate='%{customdata}<extra></extra>',
-        ), row=1, col=1)
-
-    # ── Karta R ──
-    rbar = granice['Rbar']
-    ucl_r = granice['UCL_r']
-
-    fig.add_hline(y=ucl_r, line_color=COL_UCL, line_dash='dash', line_width=1.5,
-                  annotation_text=f'UCL={ucl_r:.4f}',
-                  annotation_position='right',
-                  annotation_font_size=10,
-                  row=2, col=1)
-    fig.add_hline(y=rbar, line_color=COL_CL, line_dash='solid', line_width=1.5,
-                  annotation_text=f'R̄={rbar:.4f}',
-                  annotation_position='right',
-                  annotation_font_size=10,
-                  row=2, col=1)
-
-    mask_r_out = df_pg['R'] > ucl_r
-
-    fig.add_trace(go.Bar(
-        x=x_idx, y=df_pg['R'],
-        marker_color=[COL_OUT if m else COL_R for m in mask_r_out],
-        marker_line_width=0,
-        name='R',
-        hovertemplate='R = %{y:.4f}<extra></extra>',
-    ), row=2, col=1)
-
-    # Separator tygodni — pionowe linie
-    if 'Tydzien' in df_pg.columns:
-        prev_week = None
-        for i, (_, row) in enumerate(df_pg.iterrows()):
-            if prev_week is not None and row['Tydzien'] != prev_week:
-                for r in [1, 2]:
-                    fig.add_vline(
-                        x=i - 0.5,
-                        line_color='rgba(100,100,100,0.3)',
-                        line_dash='dot',
-                        line_width=1,
-                        row=r, col=1,
-                    )
-                # Adnotacja tygodnia
-                fig.add_annotation(
-                    x=i - 0.5, y=1.02,
-                    yref='paper',
-                    text=f'Tydz.{row["Tydzien"]}',
-                    showarrow=False,
-                    font=dict(size=9, color='#6b7280'),
-                    xanchor='center',
-                )
-            prev_week = row['Tydzien']
-
-    # Oś X — etykiety
-    tickvals = list(range(0, len(df_pg), max(1, len(df_pg) // 20)))
-    ticktext = [labels[i] for i in tickvals]
-
-    fig.update_xaxes(
-        tickvals=tickvals, ticktext=ticktext,
-        tickfont=dict(size=8),
-        row=1, col=1,
-    )
-    fig.update_xaxes(
-        tickvals=tickvals, ticktext=ticktext,
-        tickfont=dict(size=8),
-        row=2, col=1,
-    )
-
-    fig.update_layout(
-        title=dict(text=tytul, font=dict(size=14, color='#1e3a5f')),
-        height=550,
-        margin=dict(l=60, r=120, t=60, b=40),
-        plot_bgcolor='#f8fafc',
-        paper_bgcolor='white',
-        legend=dict(
-            orientation='h', y=-0.08, x=0.5, xanchor='center',
-            font=dict(size=10),
-        ),
-        hovermode='x unified',
-    )
-
-    fig.update_yaxes(gridcolor='#e2e8f0', gridwidth=1)
-
-    return fig
-
-
-# ─── WIDŻETY METRYKI Cp/Cpk ──────────────────────────────────────────────────
-
-def pokaz_metryki_spc(granice: dict):
-    cp = granice.get('Cp', np.nan)
-    cpk = granice.get('Cpk', np.nan)
-    n = granice.get('n_podgrup', 0)
-
-    def kolor_cpk(v):
-        if np.isnan(v):
-            return '#6b7280'
-        if v >= 1.67:
-            return '#059669'
-        if v >= 1.33:
-            return '#10b981'
-        if v >= 1.00:
-            return '#f59e0b'
-        return '#dc2626'
-
-    def status_cpk(v):
-        if np.isnan(v):
-            return '—'
-        if v >= 1.67:
-            return '✅ Doskonały'
-        if v >= 1.33:
-            return '✅ Zdolny'
-        if v >= 1.00:
-            return '⚠️ Marginalny'
-        return '❌ Niezdolny'
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown(f"""
-        <div style="background:#f0fdf4;border-left:4px solid #059669;
-                    padding:12px 16px;border-radius:8px;margin-bottom:8px;">
-            <div style="font-size:0.75rem;color:#6b7280;text-transform:uppercase;
-                        letter-spacing:0.05em;margin-bottom:4px;">Cp</div>
-            <div style="font-size:2rem;font-weight:700;color:#1e3a5f;line-height:1;">
-                {f'{cp:.3f}' if not np.isnan(cp) else '—'}
-            </div>
-            <div style="font-size:0.75rem;color:#6b7280;margin-top:4px;">
-                Zdolność potencjalna
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col2:
-        c = kolor_cpk(cpk if not np.isnan(cpk) else np.nan)
-        st.markdown(f"""
-        <div style="background:#fefce8;border-left:4px solid {c};
-                    padding:12px 16px;border-radius:8px;margin-bottom:8px;">
-            <div style="font-size:0.75rem;color:#6b7280;text-transform:uppercase;
-                        letter-spacing:0.05em;margin-bottom:4px;">Cpk</div>
-            <div style="font-size:2rem;font-weight:700;color:{c};line-height:1;">
-                {f'{cpk:.3f}' if not np.isnan(cpk) else '—'}
-            </div>
-            <div style="font-size:0.75rem;color:#6b7280;margin-top:4px;">
-                {status_cpk(cpk)}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col3:
-        st.markdown(f"""
-        <div style="background:#eff6ff;border-left:4px solid #2563eb;
-                    padding:12px 16px;border-radius:8px;margin-bottom:8px;">
-            <div style="font-size:0.75rem;color:#6b7280;text-transform:uppercase;
-                        letter-spacing:0.05em;margin-bottom:4px;">Podgrupy</div>
-            <div style="font-size:2rem;font-weight:700;color:#1e3a5f;line-height:1;">
-                {n}
-            </div>
-            <div style="font-size:0.75rem;color:#6b7280;margin-top:4px;">
-                X̄̄ = {granice.get('Xbarbar', 0):.4f} mm
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-# ─── GŁÓWNY WIDOK SPC ────────────────────────────────────────────────────────
-
-def pokaz_spc(plik_excel):
-    st.subheader('📈 Karty kontrolne SPC — Xbar-R')
-
-    with st.spinner('Przygotowuję dane SPC...'):
-        df_pg = przygotuj_dane_spc(plik_excel)
-
-    if df_pg.empty:
-        st.warning('Brak danych pomiarowych dla wybranych linii.')
-        return
-
-    # ── FILTRY ──
-    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-
-    with col_f1:
-        dostepne_linie = sorted(df_pg['Linia'].unique(),
-                                key=lambda x: list(LINIE_SPC).index(x) if x in LINIE_SPC else 99)
-        wybrana_linia = st.selectbox(
-            'Linia',
-            dostepne_linie,
-            format_func=lambda x: NAZWY_LINII.get(x, x),
-        )
-
-    df_linia = df_pg[df_pg['Linia'] == wybrana_linia]
-
-    with col_f2:
-        bloki = sorted(df_linia['Blok'].dropna().unique())
-        if len(bloki) > 1:
-            wybrany_blok = st.selectbox(
-                'Strona kabla',
-                bloki,
-                format_func=lambda x: BLOK_NAZWA.get(int(x), f'Blok {x}') if x else '—',
+            min_d = df_zlecenia['Data i czas startu zlecenia'].min().date()
+            max_d = df_zlecenia['Data i czas startu zlecenia'].max().date()
+            dr = st.date_input('Zakres:', value=(min_d, max_d), min_value=min_d, max_value=max_d)
+            if len(dr) == 2:
+                s_dt = pd.to_datetime(dr[0])
+                e_dt = pd.to_datetime(dr[1]) + pd.Timedelta(days=1)
+                df_f = df_zlecenia[
+                    (df_zlecenia['Data i czas startu zlecenia'] >= s_dt) &
+                    (df_zlecenia['Data i czas startu zlecenia'] < e_dt)
+                ]
+                df_k_f = df_kontakty[
+                    (df_kontakty['Data i czas startu zlecenia'] >= s_dt) &
+                    (df_kontakty['Data i czas startu zlecenia'] < e_dt)
+                ]
+                tytul = f"Zakres: {dr[0].strftime('%d.%m.%Y')} – {dr[1].strftime('%d.%m.%Y')}"
+            else:
+                st.warning('Wybierz zakres dat.')
+                st.stop()
+
+    if wybrane_linie:
+        df_f = df_f[df_f['NR LINII '].isin(wybrane_linie)]
+        df_k_f = df_k_f[df_k_f['NR LINII '].isin(wybrane_linie)]
+
+    st.subheader(tytul)
+
+    if df_f.empty:
+        st.warning('⚠️ Brak danych dla wybranych filtrów.')
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        for col, lbl, val, sub in [
+            (c1, '🔥 Próbki do SAP', f"{int(df_f['Ilosc_fizycznych_probek'].sum()):,} szt.", 'do wprowadzenia'),
+            (c2, '📦 Zestawy', f"{int(df_f['Ilosc_zestawow'].sum()):,} szt.", 'zrealizowanych'),
+            (c3, '🔌 Unikalne PN', f"{int(df_f['Suma_kontaktow'].sum()):,} szt.", 'part numberów'),
+            (c4, '🏭 Aktywne linie', str(df_f['NR LINII '].nunique()), 'linii produkcyjnych'),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="label">{lbl}</div>
+                    <div class="value">{val}</div>
+                    <div class="sub">{sub}</div>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown('<br>', unsafe_allow_html=True)
+        st.divider()
+
+        pod_linia = df_f.groupby('NR LINII ').agg(
+            Kontakty=('Suma_kontaktow', 'sum'),
+            Zestawy=('Ilosc_zestawow', 'sum'),
+            Sztuki_SAP=('Ilosc_fizycznych_probek', 'sum'),
+        ).reset_index().rename(columns={'NR LINII ': 'Linia'}).sort_values('Sztuki_SAP', ascending=False)
+        pod_linia['Udział %'] = (pod_linia['Sztuki_SAP'] / pod_linia['Sztuki_SAP'].sum() * 100).round(1)
+
+        ct, cw = st.columns([1, 1.3])
+        with ct:
+            st.markdown('**📋 Dane per linia**')
+            st.dataframe(
+                pod_linia.style.background_gradient(subset=['Sztuki_SAP'], cmap='Blues'),
+                use_container_width=True, hide_index=True,
             )
-        else:
-            wybrany_blok = bloki[0] if bloki else None
-            st.selectbox('Strona kabla',
-                         [BLOK_NAZWA.get(int(wybrany_blok), '—') if wybrany_blok else '—'],
-                         disabled=True)
+        with cw:
+            st.markdown('**📊 Próbki SAP per linia**')
+            st.bar_chart(pod_linia.set_index('Linia')['Sztuki_SAP'], color='#2d5986')
 
-    df_blok = df_linia[df_linia['Blok'] == wybrany_blok] if wybrany_blok else df_linia
+        if tryb in ('Miesięczny', 'Zakres dat'):
+            st.divider()
+            trend = df_f.groupby('Data_kalendarzowa')['Ilosc_fizycznych_probek'].sum().reset_index()
+            trend['Dzień'] = pd.to_datetime(trend['Data_kalendarzowa']).dt.strftime('%d.%m')
+            ct2, cs = st.columns([2, 1])
+            with ct2:
+                st.markdown('**📈 Trend dzienny (sztuki SAP)**')
+                st.bar_chart(trend.set_index('Dzień')['Ilosc_fizycznych_probek'], color='#1e7a4e')
+            with cs:
+                st.markdown('**📉 Statystyki dzienne**')
+                dv = trend['Ilosc_fizycznych_probek']
+                st.metric('Średnio / dzień', f'{dv.mean():.0f} szt.')
+                st.metric('Maks. dzień', f'{dv.max():.0f} szt.')
+                st.metric('Min. dzień', f'{dv.min():.0f} szt.')
+                st.metric('Dni roboczych', str(len(trend)))
 
-    with col_f3:
-        typy = sorted(df_blok['Typ'].unique())
-        wybrany_typ = st.selectbox('Typ przewodu', typy)
+        st.divider()
+        st.markdown('### 🗂️ Ściągawka do SAP')
 
-    df_typ = df_blok[df_blok['Typ'] == wybrany_typ]
+        sap_tab = df_k_f.groupby('Numer kontaktu')['Sztuki_fizyczne'].sum().reset_index()
+        sap_tab = sap_tab.rename(columns={'Numer kontaktu': 'PN', 'Sztuki_fizyczne': 'Sztuki'})
+        linia_info = df_k_f.groupby('Numer kontaktu')['NR LINII '].agg(
+            lambda x: ', '.join(sorted(set(x)))).reset_index()
+        linia_info.columns = ['PN', 'Linie']
+        sap_tab = sap_tab.merge(linia_info, on='PN').sort_values('Sztuki', ascending=False).reset_index(drop=True)
 
-    with col_f4:
-        maszyny = sorted(df_typ['Maszyna'].unique())
-        wybrana_maszyna = st.selectbox('Maszyna', maszyny)
+        cs1, cs2 = st.columns([2, 1])
+        with cs1:
+            st.dataframe(sap_tab, use_container_width=True, hide_index=True, height=280)
+        with cs2:
+            st.metric('Unikalnych PN', str(len(sap_tab)))
+            st.metric('Łącznie sztuk', f"{sap_tab['Sztuki'].sum():,}")
+            with st.expander('📄 Szczegółowe zlecenia', expanded=False):
+                st.dataframe(
+                    df_f[['Numer zlecenia ', 'NR LINII ', 'Data_kalendarzowa',
+                           'Suma_kontaktow', 'Ilosc_fizycznych_probek']]
+                    .rename(columns={
+                        'Numer zlecenia ': 'Zlecenie', 'NR LINII ': 'Linia',
+                        'Data_kalendarzowa': 'Data', 'Suma_kontaktow': 'PN',
+                        'Ilosc_fizycznych_probek': 'Szt. SAP',
+                    }).reset_index(drop=True),
+                    use_container_width=True, hide_index=True,
+                )
 
-    df_final = df_typ[df_typ['Maszyna'] == wybrana_maszyna].copy()
+        # ── GM C121 (Preassembly) ──────────────────────────────────────────────
+        st.divider()
+        st.markdown('### 🔩 GM C121 (Preassembly) — próbki do SAP')
+        try:
+            zlec_gm, sap_gm = wczytaj_gmc121(plik)
+            if not zlec_gm.empty:
+                # Filtruj do tego samego okresu co raport główny
+                if tryb == 'Dzienny / Zmianowy':
+                    zlec_gm_f = zlec_gm[
+                        (zlec_gm['Data i czas startu zlecenia'] >= s_dt) &
+                        (zlec_gm['Data i czas startu zlecenia'] <= e_dt)
+                    ]
+                    sap_gm_f_kontakty = zlec_gm_f  # do filtrowania SAP poniżej
+                elif tryb == 'Miesięczny':
+                    zlec_gm['YM'] = zlec_gm['Data i czas startu zlecenia'].dt.strftime('%Y-%m')
+                    zlec_gm_f = zlec_gm[zlec_gm['YM'] == wybrany_m]
+                else:
+                    zlec_gm_f = zlec_gm[
+                        (zlec_gm['Data i czas startu zlecenia'] >= s_dt) &
+                        (zlec_gm['Data i czas startu zlecenia'] < e_dt)
+                    ]
 
-    # Filtr tygodni
-    dostepne_tygodnie = sorted(df_final['Tydzien'].unique())
-    if len(dostepne_tygodnie) > 1:
-        zakres = st.select_slider(
-            'Zakres tygodni (numer tygodnia ISO)',
-            options=dostepne_tygodnie,
-            value=(dostepne_tygodnie[0], dostepne_tygodnie[-1]),
-        )
-        df_final = df_final[df_final['Tydzien'].between(zakres[0], zakres[1])]
+                if not zlec_gm_f.empty:
+                    cg1, cg2, cg3 = st.columns(3)
+                    cg1.metric('🔥 Próbki SAP (GM)', f"{int(zlec_gm_f['Ilosc_fizycznych_probek'].sum()):,} szt.")  # 1 kontakt = 1 szt.
+                    cg2.metric('📦 Zestawy (GM)', f"{int(zlec_gm_f['Ilosc_zestawow'].sum()):,} szt.")
+                    cg3.metric('🔌 Unikalne PN (GM)', str(int(zlec_gm_f['Suma_kontaktow'].sum())))
 
-    if df_final.empty:
-        st.info('Brak danych dla wybranej kombinacji filtrów.')
-        return
+                    st.markdown('**Ściągawka SAP — GM C121**')
+                    # Filtruj SAP do zleceń z wybranego okresu
+                    zlecenia_okresu = set(zlec_gm_f['Numer zlecenia '].tolist())
+                    # Przefiltruj df_pom przez zlecenia okresu
+                    st.dataframe(
+                        sap_gm.rename(columns={
+                            'Numer kontaktu (PN)': 'PN',
+                        }),
+                        use_container_width=True,
+                        hide_index=True, height=250,
+                    )
+                else:
+                    st.info('Brak danych GM C121 dla wybranego okresu.')
+            else:
+                st.info('Brak danych GM C121 w pliku.')
+        except Exception as e:
+            st.warning(f'Nie udało się wczytać GM C121: {e}')
 
-    # ── OBLICZENIA ──
-    granice = oblicz_granice(df_final)
+        st.divider()
+        trend_exp = None
+        if tryb in ('Miesięczny', 'Zakres dat'):
+            trend_exp = df_f.groupby('Data_kalendarzowa')['Ilosc_fizycznych_probek'].sum().reset_index()
+            trend_exp.columns = ['Data', 'Sztuki_SAP']
 
-    # ── METRYKI ──
-    blok_str = BLOK_NAZWA.get(int(wybrany_blok), '') if wybrany_blok else ''
-    linia_str = NAZWY_LINII.get(wybrana_linia, wybrana_linia)
-    tytul_karty = f'{linia_str} | {blok_str} | {wybrany_typ} | {wybrana_maszyna}'
+        cd1, cd2, _ = st.columns([1, 1, 2])
+        with cd1:
+            st.download_button(
+                '📥 Pobierz Excel',
+                data=wygeneruj_excel(pod_linia, sap_tab, trend_exp),
+                file_name=f"QGate_{datetime.date.today()}.xlsx",
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
+        with cd2:
+            st.download_button(
+                '📄 Pobierz SAP CSV',
+                data=sap_tab.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig'),
+                file_name=f"SAP_{datetime.date.today()}.csv",
+                mime='text/csv',
+            )
 
-    pokaz_metryki_spc(granice)
+# ══════════════════════════════════════════════════════════════════════════════
+# ZAKŁADKA 2 — SPC
+# ══════════════════════════════════════════════════════════════════════════════
 
-    st.markdown('<br>', unsafe_allow_html=True)
-
-    # Legenda sygnałów
-    with st.expander('ℹ️ Legenda reguł sygnałowych', expanded=False):
-        st.markdown("""
-        | Symbol | Reguła | Interpretacja |
-        |--------|--------|---------------|
-        | 🔴 ✕ | Poza 3σ | Punkt poza granicami kontrolnymi UCL/LCL |
-        | 🟠 ◆ | 2 z 3 poza 2σ | 2 z 3 kolejnych punktów po tej samej stronie za 2σ |
-        | 🟠 ◆ | 4 z 5 poza 1σ | 4 z 5 kolejnych punktów po tej samej stronie za 1σ |
-        | 🟠 ◆ | 8 po jednej stronie | 8 kolejnych punktów po tej samej stronie X̄̄ |
-        | 🟡 — | USL/LSL | Granice specyfikacji (z arkusza) |
-        | ⬜ strefy | ±1σ, ±2σ, ±3σ | Strefy kontrolne (odcienie niebieskiego) |
-        """)
-
-    # ── KARTA ──
-    fig = rysuj_karte_xbar_r(df_final, granice, tytul_karty)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── TABELA DANYCH ──
-    with st.expander('📋 Dane podgrup', expanded=False):
-        df_show = df_final[['Data', 'Zlecenie', 'Tydzien', 'Xbar', 'R', 'n', 'LSL', 'USL']].copy()
-        df_show['Data'] = df_show['Data'].dt.strftime('%d.%m.%Y %H:%M')
-        df_show = df_show.rename(columns={
-            'Data': 'Data', 'Zlecenie': 'Nr zlecenia', 'Tydzien': 'Tydz.',
-            'Xbar': 'X̄ (mm)', 'R': 'R (mm)', 'n': 'n próbek',
-        })
-        df_show['X̄ (mm)'] = df_show['X̄ (mm)'].round(4)
-        df_show['R (mm)'] = df_show['R (mm)'].round(4)
-        st.dataframe(df_show.reset_index(drop=True), use_container_width=True, hide_index=True)
+with tab_spc:
+    from spc_qgate import pokaz_spc
+    pokaz_spc(plik)

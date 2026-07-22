@@ -13,6 +13,7 @@ st.set_page_config(page_title="Q-Gate Dashboard", layout="wide", page_icon="📊
 
 st.markdown("""
 <style>
+    /* ── Metryki ── */
     .metric-card {
         background: linear-gradient(135deg, #1e3a5f 0%, #2d5986 100%);
         border-radius: 12px; padding: 1.2rem 1.5rem;
@@ -25,11 +26,50 @@ st.markdown("""
     }
     .metric-card .value { font-size: 2.1rem; font-weight: 700; line-height: 1; }
     .metric-card .sub   { font-size: 0.72rem; opacity: 0.6; margin-top: 4px; }
+
+    /* ── Ukryj domyślny header Streamlit ── */
     header { visibility: hidden; }
+
+    /* ── Zakładki ── */
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0; padding: 8px 20px;
         font-weight: 500;
+    }
+
+    /* ── Dark mode dla sekcji SPC ── */
+    /* Plotly wykresy — usuń białe obramowanie */
+    .js-plotly-plot .plotly .main-svg {
+        border-radius: 10px;
+    }
+    /* Tło legendy wykresu SPC pasuje do dark bg */
+    [data-testid="stPlotlyChart"] {
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    }
+
+    /* ── SIDEBAR: zawsze widoczny, bez przycisku collapse ── */
+    /* Ukryj przycisk strzałki zwijania */
+    button[kind="header"],
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapseButton"] {
+        display: none !important;
+    }
+    /* Zawsze pokazuj sidebar (nawet gdy Streamlit chce go ukryć) */
+    [data-testid="stSidebar"] {
+        transform: none !important;
+        min-width: 21rem !important;
+        max-width: 21rem !important;
+    }
+    /* Usuń margines który pojawia się po "zwinięciu" */
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        margin-left: 0 !important;
+        visibility: visible !important;
+    }
+    /* Główna treść — zawsze z marginesem na sidebar */
+    .main .block-container {
+        padding-left: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -121,6 +161,71 @@ def wczytaj_dane(plik_excel):
     return zlecenia_wynik, df_unikalne
 
 
+@st.cache_data(show_spinner=False)
+def wczytaj_gmc121(plik_excel):
+    """Zliczanie próbek do SAP z arkusza GM C121 (Preassembly).
+    Każdy wiersz z pomiarami = 3 sztuki fizyczne (1 zestaw × 3 szt.).
+    """
+    df = pd.read_excel(plik_excel, sheet_name='GM C121 (Preassembly)',
+                       header=2, engine='openpyxl').copy()
+
+    df['Numer zlecenia '] = df['Numer zlecenia '].astype(str).str.strip().replace(
+        ['nan', 'None', 'nan.0'], '')
+    df['Numer zlecenia '] = df['Numer zlecenia '].replace('', pd.NA).ffill()
+    df['Numer kontaktu'] = df['Numer kontaktu'].astype(str).str.strip()
+    df['Typ'] = df['Typ pojedyńczego przewodu'].astype(str).str.strip()
+    df['Data'] = pd.to_datetime(
+        df['Data i czas startu zlecenia'], errors='coerce').ffill()
+    df['Data_kalendarzowa'] = df['Data'].dt.date
+
+    POMIARY_GM = [
+        'Wysokość zaciskania - zrywy',
+        'Wysokość zaciskania -  kontrola przekroju na mikrografie',
+        'Wysokośc zaciskania - próbka poglądowa',
+    ]
+    for col in POMIARY_GM:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Liczba kontaktów per wiersz = liczba wypełnionych kolumn wysokości
+    # ZMP (zrywy+mikrograf+poglądowa) = 3 kontakty = 9 szt.
+    # Z__ (tylko zrywy)               = 1 kontakt  = 3 szt.
+    # __P (tylko poglądowa)           = 1 kontakt  = 3 szt.
+    df['NR LINII '] = 'GM C121'
+    df['Typ'] = df['Typ pojedyńczego przewodu'].fillna('').astype(str).str.strip()
+    df['n_kontaktow'] = df[POMIARY_GM].notna().sum(axis=1)  # 0, 1, 2 lub 3
+    df['ma_pomiar'] = df['n_kontaktow'] > 0
+
+    df_pom = df[df['ma_pomiar']].copy()
+    df_pom['Sztuki_fizyczne'] = df_pom['n_kontaktow'] * 3
+
+    if df_pom.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    zlec = df_pom.groupby('Numer zlecenia ').agg(
+        Suma_kontaktow=('n_kontaktow', 'sum'),
+        Data_max=('Data', 'max'),
+        NR_LINII=('NR LINII ', 'first'),
+    ).reset_index()
+    zlec['NR LINII '] = zlec.pop('NR_LINII')
+    zlec['Data i czas startu zlecenia'] = zlec.pop('Data_max')
+    zlec['Data_kalendarzowa'] = zlec['Data i czas startu zlecenia'].dt.date
+    zlec['Ilosc_zestawow'] = 1
+    zlec['Ilosc_fizycznych_probek'] = zlec['Suma_kontaktow']  # 1 kolumna = 1 kontakt = 1 szt.
+
+    # SAP per PN + Typ — suma kontaktów (każda wypełniona kolumna = 1 szt.)
+    df_pom['PN'] = df_pom['Numer kontaktu'].astype(str).str.strip()
+    df_pom.loc[df_pom['PN'].isin(['nan','None','']), 'PN'] = 'BRAK_PN'
+    sap = df_pom.groupby(['PN','Typ']).agg(
+        Kontakty=('n_kontaktow','sum')
+    ).reset_index()
+    sap['Sztuki'] = sap['Kontakty']  # 1 kolumna = 1 sztuka SAP
+    sap = sap.drop(columns='Kontakty').rename(
+        columns={'PN': 'Numer kontaktu (PN)'}
+    ).sort_values('Sztuki', ascending=False).reset_index(drop=True)
+
+    return zlec, sap
+
+
 def wygeneruj_excel(df_linia, df_sap, df_trend=None):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -136,8 +241,17 @@ def wygeneruj_excel(df_linia, df_sap, df_trend=None):
 st.title('📊 Q-Gate Dashboard — Rzeszów')
 
 with st.sidebar:
-    st.header('📁 Wczytaj dane')
-    plik = st.file_uploader('Wgraj plik Q-Gate (xlsx, xlsm):', type=['xlsx', 'xlsm'])
+    st.markdown('### 📁 Q-Gate Dashboard')
+    plik = st.file_uploader(
+        'Wgraj plik Q-Gate:',
+        type=['xlsx', 'xlsm'],
+        help='Format: xlsx lub xlsm, arkusz "Qgate 2026"',
+        label_visibility='collapsed',
+    )
+    if plik:
+        st.success(f'✅ {plik.name}', icon=None)
+    else:
+        st.caption('Obsługiwane: .xlsx, .xlsm')
 
 if not plik:
     st.info('👈 Wgraj plik produkcyjny Q-Gate żeby rozpocząć.')
@@ -161,6 +275,9 @@ if df_zlecenia.empty:
     st.stop()
 
 # ─── ZAKŁADKI ────────────────────────────────────────────────────────────────
+# Inicjalizacja zmiennych filtrów (będą wypełnione w sidebar)
+s_dt = e_dt = pd.Timestamp.now()
+wybrany_m = ''
 
 tab_raport, tab_spc = st.tabs(['📋 Raport produkcji', '📈 Karty SPC'])
 
@@ -312,6 +429,52 @@ with tab_raport:
                     }).reset_index(drop=True),
                     use_container_width=True, hide_index=True,
                 )
+
+        # ── GM C121 (Preassembly) ──────────────────────────────────────────────
+        st.divider()
+        st.markdown('### 🔩 GM C121 (Preassembly) — próbki do SAP')
+        try:
+            zlec_gm, sap_gm = wczytaj_gmc121(plik)
+            if not zlec_gm.empty:
+                # Filtruj do tego samego okresu co raport główny
+                if tryb == 'Dzienny / Zmianowy':
+                    zlec_gm_f = zlec_gm[
+                        (zlec_gm['Data i czas startu zlecenia'] >= s_dt) &
+                        (zlec_gm['Data i czas startu zlecenia'] <= e_dt)
+                    ]
+                    sap_gm_f_kontakty = zlec_gm_f  # do filtrowania SAP poniżej
+                elif tryb == 'Miesięczny':
+                    zlec_gm['YM'] = zlec_gm['Data i czas startu zlecenia'].dt.strftime('%Y-%m')
+                    zlec_gm_f = zlec_gm[zlec_gm['YM'] == wybrany_m]
+                else:
+                    zlec_gm_f = zlec_gm[
+                        (zlec_gm['Data i czas startu zlecenia'] >= s_dt) &
+                        (zlec_gm['Data i czas startu zlecenia'] < e_dt)
+                    ]
+
+                if not zlec_gm_f.empty:
+                    cg1, cg2, cg3 = st.columns(3)
+                    cg1.metric('🔥 Próbki SAP (GM)', f"{int(zlec_gm_f['Ilosc_fizycznych_probek'].sum()):,} szt.")  # 1 kontakt = 1 szt.
+                    cg2.metric('📦 Zestawy (GM)', f"{int(zlec_gm_f['Ilosc_zestawow'].sum()):,} szt.")
+                    cg3.metric('🔌 Unikalne PN (GM)', str(int(zlec_gm_f['Suma_kontaktow'].sum())))
+
+                    st.markdown('**Ściągawka SAP — GM C121**')
+                    # Filtruj SAP do zleceń z wybranego okresu
+                    zlecenia_okresu = set(zlec_gm_f['Numer zlecenia '].tolist())
+                    # Przefiltruj df_pom przez zlecenia okresu
+                    st.dataframe(
+                        sap_gm.rename(columns={
+                            'Numer kontaktu (PN)': 'PN',
+                        }),
+                        use_container_width=True,
+                        hide_index=True, height=250,
+                    )
+                else:
+                    st.info('Brak danych GM C121 dla wybranego okresu.')
+            else:
+                st.info('Brak danych GM C121 w pliku.')
+        except Exception as e:
+            st.warning(f'Nie udało się wczytać GM C121: {e}')
 
         st.divider()
         trend_exp = None
