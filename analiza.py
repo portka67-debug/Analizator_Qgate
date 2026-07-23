@@ -76,12 +76,35 @@ st.markdown("""
 
 # ─── SILNIK ANALITYCZNY ───────────────────────────────────────────────────────
 
-KOLUMNY_PROBEK = [
-    'Wysokość zaciskania - zrywy',
-    'Wysokość zaciskania -  kontrola przekroju na mikrografie',
-    'Wysokość zaciskania - próbka poglądowa',
-]
 LINIE_DO_IGNOROWANIA = {'`', '', 'NAN'}
+
+
+def _znajdz_kolumne(df, *fragmenty, wymagana=True):
+    """Znajduje kolumnę zawierającą wszystkie podane fragmenty (bez względu
+    na spacje/wielkość liter). Odporne na różnice między wersjami pliku."""
+    def uprość(s):
+        return re.sub(r'\s+', ' ', str(s).lower().strip())
+    frag_low = [uprość(f) for f in fragmenty]
+    for col in df.columns:
+        cl = uprość(col)
+        if all(f in cl for f in frag_low):
+            return col
+    if wymagana:
+        raise KeyError(f"Nie znaleziono kolumny z fragmentami: {fragmenty}")
+    return None
+
+
+def _wczytaj_arkusz(plik_excel, sheet_name):
+    """Wczytuje arkusz auto-wykrywając wiersz nagłówka (3 lub 2).
+    W nowszych plikach Qgate 2026 nagłówek przesunął się do wiersza 3."""
+    for hdr in (3, 2):
+        df = pd.read_excel(plik_excel, sheet_name=sheet_name,
+                           header=hdr, engine='openpyxl').copy()
+        cols_str = ' '.join(str(c) for c in df.columns[:12])
+        if 'Numer zlecenia' in cols_str and 'Kolumna1' not in cols_str:
+            return df
+    return pd.read_excel(plik_excel, sheet_name=sheet_name,
+                         header=2, engine='openpyxl').copy()
 
 
 def normalizuj_linie(tekst):
@@ -90,7 +113,11 @@ def normalizuj_linie(tekst):
     t = str(tekst).upper().strip()
     t = re.sub(r'[\.\-/_]', ' ', t)
     t = ' '.join(t.split())
-    if 'UNI INLET' in t or t == 'INLET':
+    if 'NACS' in t and 'DC' in t:
+        return 'NACS DC'
+    if t == 'NAC' or t == 'NACS':
+        return 'NACS'
+    if 'UNIINLET' in t.replace(' ', '') or t == 'INLET':
         return 'INLET'
     if 'CCSD' in t.replace(' ', '') or t == 'CCS D':
         return 'CCS D'
@@ -100,60 +127,73 @@ def normalizuj_linie(tekst):
         return 'HPC 1.0'
     if 'HPC' in t and '2' in t:
         return 'HPC 2.0'
+    if 'PREASSY' in t and 'GEN 3' in t:
+        return 'PREASSY GEN 3'
+    if 'PREASSY' in t and ('GEN 2' in t or 'GEN2' in t):
+        return 'PREASSY GEN 2'
     return t
 
 
 @st.cache_data(show_spinner='Wczytuję dane...')
 def wczytaj_dane(plik_excel):
-    df = pd.read_excel(plik_excel, sheet_name='Qgate 2026', header=2, engine='openpyxl').copy()
+    df = _wczytaj_arkusz(plik_excel, 'Qgate 2026')
 
-    for col in ['Numer zlecenia ', 'NR LINII ', 'Numer kontaktu', 'Typ pojedyńczego przewodu']:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
+    c_zlec    = _znajdz_kolumne(df, 'numer zlecenia')
+    c_linia   = _znajdz_kolumne(df, 'nr linii')
+    c_kontakt = _znajdz_kolumne(df, 'numer kontaktu')
+    c_typ     = _znajdz_kolumne(df, 'typ pojedy')
+    c_data    = _znajdz_kolumne(df, 'data i czas startu')
+    c_zryw    = _znajdz_kolumne(df, 'zaciskania', 'zrywy')
+    c_mikro   = _znajdz_kolumne(df, 'zaciskania', 'mikrografie')
+    c_poglad  = _znajdz_kolumne(df, 'zaciskania', 'poglądowa')
 
-    df['NR LINII '] = df['NR LINII '].apply(normalizuj_linie)
-    df['Numer zlecenia '] = df['Numer zlecenia '].replace('', pd.NA).ffill()
-    df['NR LINII '] = df['NR LINII '].replace('', pd.NA).ffill()
-    df = df[~df['NR LINII '].isin(LINIE_DO_IGNOROWANIA)]
+    for col in [c_zlec, c_linia, c_kontakt, c_typ]:
+        df[col] = df[col].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
 
-    df['Data i czas startu zlecenia'] = pd.to_datetime(
-        df['Data i czas startu zlecenia'], errors='coerce').ffill()
+    df['Linia'] = df[c_linia].apply(normalizuj_linie)
+    df['Zlecenie'] = df[c_zlec].replace('', pd.NA).ffill()
+    df['Linia'] = df['Linia'].replace('', pd.NA).ffill()
+    df = df[~df['Linia'].isin(LINIE_DO_IGNOROWANIA)]
+
+    df['Data i czas startu zlecenia'] = pd.to_datetime(df[c_data], errors='coerce').ffill()
     df['Data_kalendarzowa'] = df['Data i czas startu zlecenia'].dt.date
 
-    for col in KOLUMNY_PROBEK:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['_zryw']  = pd.to_numeric(df[c_zryw], errors='coerce')
+    df['_mikro'] = pd.to_numeric(df[c_mikro], errors='coerce')
+    df['_pogl']  = pd.to_numeric(df[c_poglad], errors='coerce')
+    df['Kontakt'] = df[c_kontakt].astype(str).str.strip()
+    df['Typ'] = df[c_typ].astype(str).str.strip()
 
-    df['Wiersz_ma_probke'] = df[KOLUMNY_PROBEK].notna().any(axis=1)
+    df['Wiersz_ma_probke'] = df[['_zryw', '_mikro', '_pogl']].notna().any(axis=1)
 
     # Liczymy TYLKO wiersze z rzeczywistym pomiarem wysokości zaciskania.
-    # Kontakty bez wpisanych wartości (np. PP zakrępowany z rezystorem)
-    # nie trafiają do raportu — nie mamy ich pomiaru więc ich nie scrappujemy.
     zlecenia_status = df.groupby(
-        ['Numer zlecenia ', 'NR LINII ', 'Data_kalendarzowa']
+        ['Zlecenie', 'Linia', 'Data_kalendarzowa']
     )['Wiersz_ma_probke'].any().reset_index()
     zestawy_aktywne = zlecenia_status[zlecenia_status['Wiersz_ma_probke']]
 
     df_zestawy = pd.merge(
-        df, zestawy_aktywne[['Numer zlecenia ', 'NR LINII ', 'Data_kalendarzowa']],
-        on=['Numer zlecenia ', 'NR LINII ', 'Data_kalendarzowa'], how='inner',
+        df, zestawy_aktywne[['Zlecenie', 'Linia', 'Data_kalendarzowa']],
+        on=['Zlecenie', 'Linia', 'Data_kalendarzowa'], how='inner',
     )
-    # Tylko wiersze z pomiarem — żadnych wyjątków dla PP/DC bez danych
     # Klucz deduplikacji BEZ Data_kalendarzowa — ten sam kontakt mierzony
-    # na początku i końcu produkcji (różne dni) to nadal jedna fizyczna próbka.
+    # na początku i końcu produkcji (różne dni) to nadal jedna próbka.
     df_unikalne = df_zestawy[df_zestawy['Wiersz_ma_probke']].drop_duplicates(
-        subset=['Numer zlecenia ', 'NR LINII ',
-                'Numer kontaktu', 'Typ pojedyńczego przewodu']
+        subset=['Zlecenie', 'Linia', 'Kontakt', 'Typ']
     ).copy()
     df_unikalne['Sztuki_fizyczne'] = 3
+    # Aliasy dla zgodności z resztą kodu
+    df_unikalne['Numer kontaktu'] = df_unikalne['Kontakt']
+    df_unikalne['NR LINII '] = df_unikalne['Linia']
 
-    zlecenia_wynik = df_unikalne.groupby(
-        ['Numer zlecenia ', 'NR LINII ']
-    ).agg(
-        Suma_kontaktow=('Numer kontaktu', 'size'),
+    zlecenia_wynik = df_unikalne.groupby(['Zlecenie', 'Linia']).agg(
+        Suma_kontaktow=('Kontakt', 'size'),
         Data_max=('Data i czas startu zlecenia', 'max'),
-    ).reset_index().rename(columns={'Data_max': 'Data i czas startu zlecenia'})
+    ).reset_index().rename(columns={
+        'Data_max': 'Data i czas startu zlecenia',
+        'Linia': 'NR LINII ',
+    })
 
-    # Data_kalendarzowa wyznaczona z daty pierwszego pomiaru w zleceniu
     zlecenia_wynik['Data_kalendarzowa'] = zlecenia_wynik['Data i czas startu zlecenia'].dt.date
     zlecenia_wynik['Ilosc_zestawow'] = 1
     zlecenia_wynik['Ilosc_fizycznych_probek'] = zlecenia_wynik['Suma_kontaktow'] * 3
@@ -166,59 +206,56 @@ def wczytaj_gmc121(plik_excel):
     """Zliczanie próbek do SAP z arkusza GM C121 (Preassembly).
     Każdy wiersz z pomiarami = 3 sztuki fizyczne (1 zestaw × 3 szt.).
     """
-    df = pd.read_excel(plik_excel, sheet_name='GM C121 (Preassembly)',
-                       header=2, engine='openpyxl').copy()
+    df = _wczytaj_arkusz(plik_excel, 'GM C121 (Preassembly)')
 
-    df['Numer zlecenia '] = df['Numer zlecenia '].astype(str).str.strip().replace(
-        ['nan', 'None', 'nan.0'], '')
-    df['Numer zlecenia '] = df['Numer zlecenia '].replace('', pd.NA).ffill()
-    df['Numer kontaktu'] = df['Numer kontaktu'].astype(str).str.strip()
-    df['Typ'] = df['Typ pojedyńczego przewodu'].astype(str).str.strip()
-    df['Data'] = pd.to_datetime(
-        df['Data i czas startu zlecenia'], errors='coerce').ffill()
+    c_zlec    = _znajdz_kolumne(df, 'numer zlecenia')
+    c_kontakt = _znajdz_kolumne(df, 'numer kontaktu')
+    c_typ     = _znajdz_kolumne(df, 'typ pojedy')
+    c_data    = _znajdz_kolumne(df, 'data i czas startu')
+    c_zryw    = _znajdz_kolumne(df, 'zaciskania', 'zrywy')
+    c_mikro   = _znajdz_kolumne(df, 'zaciskania', 'mikrografie')
+    c_poglad  = _znajdz_kolumne(df, 'zaciskania', 'poglądowa')
+
+    df[c_zlec] = df[c_zlec].astype(str).str.strip().replace(['nan', 'None', 'nan.0'], '')
+    df['Zlecenie'] = df[c_zlec].replace('', pd.NA).ffill()
+    df['Numer kontaktu'] = df[c_kontakt].astype(str).str.strip()
+    df['Typ'] = df[c_typ].fillna('').astype(str).str.strip()
+    df['Data'] = pd.to_datetime(df[c_data], errors='coerce').ffill()
     df['Data_kalendarzowa'] = df['Data'].dt.date
+    df['NR LINII '] = 'GM C121'
 
-    POMIARY_GM = [
-        'Wysokość zaciskania - zrywy',
-        'Wysokość zaciskania -  kontrola przekroju na mikrografie',
-        'Wysokośc zaciskania - próbka poglądowa',
-    ]
-    for col in POMIARY_GM:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['_zryw']  = pd.to_numeric(df[c_zryw], errors='coerce')
+    df['_mikro'] = pd.to_numeric(df[c_mikro], errors='coerce')
+    df['_pogl']  = pd.to_numeric(df[c_poglad], errors='coerce')
 
     # Liczba kontaktów per wiersz = liczba wypełnionych kolumn wysokości
-    # ZMP (zrywy+mikrograf+poglądowa) = 3 kontakty = 9 szt.
-    # Z__ (tylko zrywy)               = 1 kontakt  = 3 szt.
-    # __P (tylko poglądowa)           = 1 kontakt  = 3 szt.
-    df['NR LINII '] = 'GM C121'
-    df['Typ'] = df['Typ pojedyńczego przewodu'].fillna('').astype(str).str.strip()
-    df['n_kontaktow'] = df[POMIARY_GM].notna().sum(axis=1)  # 0, 1, 2 lub 3
+    # ZMP (zrywy+mikrograf+poglądowa) = 3 kontakty = 3 szt.
+    # Z__ / __P (jedna kolumna)       = 1 kontakt  = 1 szt.
+    df['n_kontaktow'] = df[['_zryw', '_mikro', '_pogl']].notna().sum(axis=1)
     df['ma_pomiar'] = df['n_kontaktow'] > 0
 
     df_pom = df[df['ma_pomiar']].copy()
-    df_pom['Sztuki_fizyczne'] = df_pom['n_kontaktow'] * 3
 
     if df_pom.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    zlec = df_pom.groupby('Numer zlecenia ').agg(
+    zlec = df_pom.groupby('Zlecenie').agg(
         Suma_kontaktow=('n_kontaktow', 'sum'),
         Data_max=('Data', 'max'),
-        NR_LINII=('NR LINII ', 'first'),
-    ).reset_index()
-    zlec['NR LINII '] = zlec.pop('NR_LINII')
+    ).reset_index().rename(columns={'Zlecenie': 'Numer zlecenia '})
+    zlec['NR LINII '] = 'GM C121'
     zlec['Data i czas startu zlecenia'] = zlec.pop('Data_max')
     zlec['Data_kalendarzowa'] = zlec['Data i czas startu zlecenia'].dt.date
     zlec['Ilosc_zestawow'] = 1
-    zlec['Ilosc_fizycznych_probek'] = zlec['Suma_kontaktow']  # 1 kolumna = 1 kontakt = 1 szt.
+    zlec['Ilosc_fizycznych_probek'] = zlec['Suma_kontaktow']  # 1 kolumna = 1 szt.
 
-    # SAP per PN + Typ — suma kontaktów (każda wypełniona kolumna = 1 szt.)
+    # SAP per PN + Typ
     df_pom['PN'] = df_pom['Numer kontaktu'].astype(str).str.strip()
-    df_pom.loc[df_pom['PN'].isin(['nan','None','']), 'PN'] = 'BRAK_PN'
-    sap = df_pom.groupby(['PN','Typ']).agg(
-        Kontakty=('n_kontaktow','sum')
+    df_pom.loc[df_pom['PN'].isin(['nan', 'None', '']), 'PN'] = 'BRAK_PN'
+    sap = df_pom.groupby(['PN', 'Typ']).agg(
+        Kontakty=('n_kontaktow', 'sum')
     ).reset_index()
-    sap['Sztuki'] = sap['Kontakty']  # 1 kolumna = 1 sztuka SAP
+    sap['Sztuki'] = sap['Kontakty']
     sap = sap.drop(columns='Kontakty').rename(
         columns={'PN': 'Numer kontaktu (PN)'}
     ).sort_values('Sztuki', ascending=False).reset_index(drop=True)
@@ -252,6 +289,7 @@ with st.sidebar:
         st.success(f'✅ {plik.name}', icon=None)
     else:
         st.caption('Obsługiwane: .xlsx, .xlsm')
+    st.caption('wersja 2026.07.23 · elastyczne kolumny')
 
 if not plik:
     st.info('👈 Wgraj plik produkcyjny Q-Gate żeby rozpocząć.')
@@ -420,10 +458,10 @@ with tab_raport:
             st.metric('Łącznie sztuk', f"{sap_tab['Sztuki'].sum():,}")
             with st.expander('📄 Szczegółowe zlecenia', expanded=False):
                 st.dataframe(
-                    df_f[['Numer zlecenia ', 'NR LINII ', 'Data_kalendarzowa',
+                    df_f[['Zlecenie', 'NR LINII ', 'Data_kalendarzowa',
                            'Suma_kontaktow', 'Ilosc_fizycznych_probek']]
                     .rename(columns={
-                        'Numer zlecenia ': 'Zlecenie', 'NR LINII ': 'Linia',
+                        'NR LINII ': 'Linia',
                         'Data_kalendarzowa': 'Data', 'Suma_kontaktow': 'PN',
                         'Ilosc_fizycznych_probek': 'Szt. SAP',
                     }).reset_index(drop=True),
